@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=Leporello
+Comment=iCloud reminder alerts
+Exec=leporello --background
+Icon=x-office-calendar
+Terminal=false
+Type=Application
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
+X-GNOME-UsesNotifications=true

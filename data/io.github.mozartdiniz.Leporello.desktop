@@ -1,0 +1,12 @@
+[Desktop Entry]
+Name=Leporello
+GenericName=Reminders
+Comment=Your iCloud reminders
+Exec=leporello
+Icon=x-office-calendar
+Terminal=false
+Type=Application
+Categories=Office;ProjectManagement;GTK;
+Keywords=reminders;todo;tasks;icloud;
+StartupNotify=true
+X-GNOME-UsesNotifications=true
