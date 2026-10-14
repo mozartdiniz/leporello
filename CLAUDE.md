@@ -40,7 +40,7 @@ remindkit/    protocol crate, no GTK
 src/
   main.rs       app, tokio runtime, accels, --background, LEPORELLO_SNAPSHOT
   window.rs     window + controller (session, sync, writes, rendering)
-  editor.rs     inspector dialog: new reminder (editable), details (read-only)
+  editor.rs     inspector dialog: new reminder, details (both editable)
   notifier.rs   desktop alerts from synced alarms
   config.rs     ~/.cache/leporello/{store,state}.json
   secrets.rs    keyring
@@ -60,21 +60,22 @@ data/         .desktop + autostart entry
 - **Every field write bumps `ResolutionTokenMap`** (per-field LWW clock).
 - **Alerts are local.** The app stays alive after the window closes (the
   window hides; Ctrl+Q quits) and autostarts with `--background`.
-- **Existing reminders are read-only except complete/delete** for now.
+- **Existing reminders are fully editable** (`Writer::edit`) except Repeat
+  and Urgent. Changed child records (due-date alarm, URL, tags) are
+  soft-deleted and recreated, as icloud.com does.
 - Repeat and Urgent can't be *set* yet: RecurrenceRule encodings are
   unverified, and Urgent needs an asset upload. Both are *shown*.
 - Shared lists (CloudKit shared database) are not loaded yet.
 
-## Status (2026-10-13, macOS dev machine)
+## Status (2026-10-14, Linux)
 
-Verified live (read-only, through the probe): sign-in reuse, zones, the full
-schema, title/notes decoding, alarms/triggers, URL attachments, early-alert
-and urgent JSON. Nothing has been **written** to the account yet: the first
-create/complete/delete needs the user's go-ahead, then a diff against a
-reminder made on the Mac (see the protocol doc's open questions).
+Running signed in on Linux and installed with `just install`. Verified live
+by the user: reading, create, complete, delete, and editing every field
+(title, notes, date/time, early reminder, list, URL, tags, flag, priority),
+with the changes showing up on the Mac.
 
-The GTK app builds and renders (checked with the fixture via
-`LEPORELLO_SNAPSHOT`), but hasn't been signed in or run on Linux yet.
+Still open: Repeat and Urgent writes, shared lists, and the protocol doc's
+open questions (e.g. `List.ReminderIDs` ordering).
 
 ## Commands
 

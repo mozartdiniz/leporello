@@ -285,8 +285,26 @@ Record shape rules **[live]**:
 - Every child record has a CloudKit `parent` (`{"recordName": ...}`):
   Reminder → List, Alarm/Attachment → Reminder, AlarmTrigger → Alarm.
   Hashtags have none.
-- There's no null value in the web API. Uncompleted reminders simply have
-  no `CompletionDate`, so reopening leaves the old one in place.
+- Uncompleted reminders simply have no `CompletionDate`; reopening leaves
+  the old one in place.
+
+## Editing a reminder **[web app, main.js 2636Build17] [live]**
+
+What icloud.com's `writeReminderFields` / `handleEditDate` does, and
+`Writer::edit` copies:
+
+- Changing the date soft-deletes the old Date `Alarm` and its
+  `AlarmTrigger` (only `Deleted` = 1 written, no token map), drops its ID
+  from `AlarmIDs`, and creates a new alarm when the new date has a time.
+- Removing the date sends `DueDate`, `TimeZone` (and `AllDay`) as
+  `{"value": null}`: the web app's field setter only skips `undefined`.
+  Leporello writes `AllDay` 0 instead of null.
+- Moving to another list: icloud.com also edits both lists' `ReminderIDs`
+  (a CRDT ordering). Leporello only changes `List` and the CloudKit
+  `parent`, as it does for new reminders **[unknown whether Apple cares]**.
+- URL and tag changes: Leporello soft-deletes the old `Attachment` /
+  `Hashtag` records and creates new ones, updating `AttachmentIDs` /
+  `HashtagIDs`. `DueDateDeltaAlertsData` is rewritten whole.
 
 Open questions for the first live write **[unknown]**:
 - Whether the new reminder must also be appended to `List.ReminderIDs`

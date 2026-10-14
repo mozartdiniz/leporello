@@ -16,7 +16,7 @@ use std::rc::Rc;
 use adw::prelude::*;
 use chrono::{Local, NaiveDate, Utc};
 use gtk::{gio, glib};
-use remindkit::{Error, ICloudClient, List, Reminder, SignInOutcome, Store, TrustedPhone, Writer};
+use remindkit::{Edits, Error, ICloudClient, List, Reminder, SignInOutcome, Store, TrustedPhone, Writer};
 use serde_json::Value;
 
 use crate::config::{self, State};
@@ -807,6 +807,20 @@ impl Inner {
         self.write(ops, "Reminder deleted");
     }
 
+    fn edit(self: &Rc<Self>, record_name: &str, edits: &Edits) {
+        let ops = {
+            let store = self.store.borrow();
+            let Some(store) = store.as_ref() else { return };
+            let (Some(record), Some(w)) = (store.record(record_name), self.writer(store)) else { return };
+            w.edit(store, record, edits)
+        };
+        match ops {
+            Ok(ops) if ops.is_empty() => {}
+            Ok(ops) => self.write(ops, "Saved"),
+            Err(e) => self.toast(&format!("Couldn't edit: {e}")),
+        }
+    }
+
     fn open(self: &Rc<Self>, record_name: &str) {
         let Some(r) = self.reminders().into_iter().find(|r| r.record_name == record_name) else { return };
         let urgent = self.urgent(&r);
@@ -815,6 +829,7 @@ impl Inner {
         editor::show_reminder(&self.window, &r, &self.lists(), urgent, move |action| match action {
             Action::Complete(done) => this.set_completed(&name, done),
             Action::Delete => this.delete(&name),
+            Action::Save(edits) => this.edit(&name, &edits),
         });
     }
 

@@ -11,7 +11,7 @@ use std::rc::Rc;
 use adw::prelude::*;
 use chrono::{Datelike, Local, NaiveDate, Timelike};
 use gtk::glib;
-use remindkit::{Draft, EarlyAlert, List, Priority, Reminder};
+use remindkit::{Draft, EarlyAlert, Edits, List, Priority, Reminder, Schedule};
 
 const PRIORITIES: [(Priority, &str); 4] =
     [(Priority::None, "None"), (Priority::Low, "Low"), (Priority::Medium, "Medium"), (Priority::High, "High")];
@@ -289,9 +289,10 @@ pub fn new_reminder(
 pub enum Action {
     Complete(bool),
     Delete,
+    Save(Edits),
 }
 
-/// Read-only inspector for `r`.
+/// Inspector for `r`. Everything is editable except Urgent and Repeat.
 pub fn show_reminder(
     parent: &impl IsA<gtk::Widget>,
     r: &Reminder,
@@ -329,12 +330,18 @@ pub fn show_reminder(
     } else {
         f.repeat.set_subtitle("");
     }
-    let early_label = match r.early_alerts.first() {
-        Some(a) => a.label(),
-        None => "None".into(),
+    // An early reminder that isn't a preset gets its own entry at the end.
+    let presets = EarlyAlert::presets();
+    let old_early = r.early_alerts.first().copied();
+    let custom_early = old_early.filter(|a| !presets.iter().any(|(p, _)| p == a));
+    if let (Some(a), Some(model)) = (custom_early, f.early.model().and_downcast::<gtk::StringList>()) {
+        model.append(&a.label());
+    }
+    let early_index = match old_early {
+        None => 0,
+        Some(a) => presets.iter().position(|(p, _)| *p == a).unwrap_or(presets.len()) + 1,
     };
-    let model = gtk::StringList::new(&[&early_label]);
-    f.early.set_model(Some(&model));
+    f.early.set_selected(early_index as u32);
     if let Some(i) = r.list.as_ref().and_then(|l| lists.iter().position(|x| &x.record_name == l)) {
         f.list.set_selected(i as u32);
     }
@@ -342,14 +349,6 @@ pub fn show_reminder(
     f.flag.set_active(r.flagged);
     f.priority.set_selected(PRIORITIES.iter().position(|(p, _)| *p == r.priority).unwrap_or(0) as u32);
 
-    // Read-only: keep scrolling and text selection, block changes.
-    f.title.set_editable(false);
-    f.notes.set_editable(false);
-    f.url.set_editable(false);
-    f.tags.set_editable(false);
-    for w in [f.date.upcast_ref::<gtk::Widget>(), f.time.upcast_ref(), f.early.upcast_ref(), f.list.upcast_ref(), f.flag.upcast_ref(), f.priority.upcast_ref()] {
-        w.set_can_target(false);
-    }
     if !r.other_alarms.is_empty() || !r.alarms.is_empty() {
         let extra: Vec<String> = r
             .alarms
@@ -363,18 +362,107 @@ pub fn show_reminder(
     let on_action = Rc::new(on_action);
     let close = gtk::Button::from_icon_name("window-close-symbolic");
     close.set_tooltip_text(Some("Close"));
-    let done = gtk::Button::with_label(if r.completed { "Mark Not Completed" } else { "Mark Completed" });
-    done.add_css_class("suggested-action");
+    let save = gtk::Button::with_label("Save");
+    save.add_css_class("suggested-action");
+    save.set_sensitive(false);
     f.header.pack_start(&close);
-    f.header.pack_end(&done);
+    f.header.pack_end(&save);
 
+    let done = gtk::Button::with_label(if r.completed { "Mark Not Completed" } else { "Mark Completed" });
+    done.add_css_class("pill");
     let delete = gtk::Button::with_label("Delete Reminder");
     delete.add_css_class("destructive-action");
     delete.add_css_class("pill");
-    delete.set_halign(gtk::Align::Center);
+    let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    buttons.set_halign(gtk::Align::Center);
+    buttons.append(&done);
+    buttons.append(&delete);
     let bottom = adw::PreferencesGroup::new();
-    bottom.add(&delete);
+    bottom.add(&buttons);
     f.page.add(&bottom);
+
+    let old_schedule = Schedule {
+        due_date: r.due.as_ref().map(|d| d.local_date()),
+        due_time: r.due.as_ref().filter(|d| !d.all_day).map(|d| {
+            let t = d.at.with_timezone(&Local);
+            (t.hour(), t.minute())
+        }),
+        early_alert: old_early,
+    };
+    let edits = {
+        let (f, r) = (f.clone(), r.clone());
+        let tag_set = |tags: &[String]| {
+            let mut t: Vec<String> = tags.iter().map(|t| t.trim_start_matches('#').to_string()).filter(|t| !t.is_empty()).collect();
+            t.sort();
+            t.dedup();
+            t
+        };
+        move || {
+            let d = f.draft();
+            let mut schedule = d.schedule();
+            if f.early.selected() as usize == presets.len() + 1 {
+                schedule.early_alert = custom_early;
+            }
+            Edits {
+                title: Some(d.title.clone()).filter(|t| *t != r.title.trim() && !t.is_empty()),
+                notes: Some(d.notes.clone()).filter(|n| *n != r.notes.trim()),
+                flagged: Some(d.flagged).filter(|&v| v != r.flagged),
+                priority: Some(d.priority).filter(|&p| p != r.priority),
+                list: Some(d.list.clone()).filter(|l| !l.is_empty() && Some(l) != r.list.as_ref()),
+                schedule: Some(schedule).filter(|s| *s != old_schedule),
+                url: Some(d.url.clone()).filter(|u| u.as_deref().unwrap_or("").trim() != r.urls.join(" ")),
+                tags: Some(d.tags.clone()).filter(|t| tag_set(t) != tag_set(&r.tags)),
+            }
+        }
+    };
+    let edits = Rc::new(edits);
+    let changed = {
+        let (save, edits) = (save.clone(), edits.clone());
+        Rc::new(move || save.set_sensitive(!edits().is_empty()))
+    };
+    {
+        let c = changed.clone();
+        f.title.connect_changed(move |_| c());
+        let c = changed.clone();
+        f.notes.buffer().connect_changed(move |_| c());
+        for e in [&f.url, &f.tags] {
+            let c = changed.clone();
+            e.connect_changed(move |_| c());
+        }
+        for e in [&f.date, &f.time] {
+            let c = changed.clone();
+            e.connect_enable_expansion_notify(move |_| c());
+        }
+        let c = changed.clone();
+        f.calendar.connect_day_selected(move |_| c());
+        for s in [&f.hour, &f.minute] {
+            let c = changed.clone();
+            s.connect_value_notify(move |_| c());
+        }
+        for row in [&f.early, &f.list, &f.priority] {
+            let c = changed.clone();
+            row.connect_selected_notify(move |_| c());
+        }
+        let c = changed.clone();
+        f.flag.connect_active_notify(move |_| c());
+    }
+    {
+        let (f2, on_action, edits) = (f.clone(), on_action.clone(), edits.clone());
+        let submit = Rc::new(move || {
+            let e = edits();
+            if e.is_empty() {
+                return;
+            }
+            f2.dialog.close();
+            on_action(Action::Save(e));
+        });
+        let s = submit.clone();
+        save.connect_clicked(move |_| s());
+        f.title.connect_entry_activated(move |_| submit());
+    }
+    f.title.set_show_apply_button(false);
+    f.url.set_show_apply_button(false);
+    f.tags.set_show_apply_button(false);
     {
         let f = f.clone();
         close.connect_clicked(move |_| {

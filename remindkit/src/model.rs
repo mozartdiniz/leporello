@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use crate::document;
+use crate::{crdt, document, Result};
 
 /// Seconds between 1970-01-01 and Apple's reference date, 2001-01-01.
 const APPLE_EPOCH: f64 = 978_307_200.0;
@@ -389,7 +389,43 @@ pub struct Draft {
     pub priority: Priority,
 }
 
-impl Draft {
+/// Changes to an existing reminder (`None` = unchanged).
+#[derive(Debug, Clone, Default)]
+pub struct Edits {
+    pub title: Option<String>,
+    pub notes: Option<String>,
+    pub flagged: Option<bool>,
+    pub priority: Option<Priority>,
+    /// `List/<UUID>` to move the reminder to.
+    pub list: Option<String>,
+    pub schedule: Option<Schedule>,
+    /// `Some(None)` removes the URL.
+    pub url: Option<Option<String>>,
+    pub tags: Option<Vec<String>>,
+}
+
+impl Edits {
+    pub fn is_empty(&self) -> bool {
+        self.title.is_none()
+            && self.notes.is_none()
+            && self.flagged.is_none()
+            && self.priority.is_none()
+            && self.list.is_none()
+            && self.schedule.is_none()
+            && self.url.is_none()
+            && self.tags.is_none()
+    }
+}
+
+/// Due date, time and early reminder, which share the due-date alarm.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Schedule {
+    pub due_date: Option<NaiveDate>,
+    pub due_time: Option<(u32, u32)>,
+    pub early_alert: Option<EarlyAlert>,
+}
+
+impl Schedule {
     /// `DueDate` instant and whether it's all-day.
     pub fn due(&self) -> Option<(DateTime<Utc>, bool)> {
         let date = self.due_date?;
@@ -401,6 +437,28 @@ impl Draft {
             None => (Utc.from_utc_datetime(&date.and_hms_opt(0, 0, 0)?), true),
         })
     }
+}
+
+impl Draft {
+    pub fn schedule(&self) -> Schedule {
+        Schedule { due_date: self.due_date, due_time: self.due_time, early_alert: self.early_alert }
+    }
+
+    /// `DueDate` instant and whether it's all-day.
+    pub fn due(&self) -> Option<(DateTime<Utc>, bool)> {
+        self.schedule().due()
+    }
+}
+
+/// Tag names as stored: no `#`, no blanks, no repeats.
+fn clean_tags(tags: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for t in tags.iter().map(|t| t.trim().trim_start_matches('#')).filter(|t| !t.is_empty()) {
+        if !out.iter().any(|o| o == t) {
+            out.push(t.to_string());
+        }
+    }
+    out
 }
 
 /// Builds the `records/modify` operations Leporello sends.
@@ -468,20 +526,7 @@ impl Writer<'_> {
                 let (alarm_id, alarm_ops) = self.date_alarm(&name, due, &tz);
                 alarm_ids.push(alarm_id);
                 ops.extend(alarm_ops);
-                let alert = d.early_alert.unwrap_or(EarlyAlert { count: 0, unit: DeltaUnit::Minute });
-                let data = json!({
-                    "dueDateDeltaAlerts": [{
-                        "identifier": new_id(),
-                        "dueDateDeltaCount": alert.count,
-                        "dueDateDeltaUnit": alert.unit.raw(),
-                        "creationDate": now_ref,
-                        "minimumSupportedAppVersion": 0,
-                    }],
-                    "reminderIdentifier": id,
-                    "accountIdentifier": self.account_identifier,
-                    "minimumSupportedVersion": DELTA_ALERTS_VERSION,
-                });
-                set("DueDateDeltaAlertsData", json!(B64.encode(data.to_string())));
+                set("DueDateDeltaAlertsData", self.delta_alerts(&id, d.early_alert));
             }
         } else {
             set("AllDay", json!(0));
@@ -490,42 +535,16 @@ impl Writer<'_> {
 
         let mut attachment_ids = Vec::new();
         if let Some(url) = d.url.as_deref().map(str::trim).filter(|u| !u.is_empty()) {
-            let aid = new_id();
-            ops.push(create_op(
-                &format!("Attachment/{aid}"),
-                "Attachment",
-                Some(&name),
-                self.zone_id,
-                json!({
-                    "Reminder": { "value": self.reference(&name) },
-                    "Type": { "value": "URL" },
-                    "URL": encrypted_string(url),
-                    "UTI": { "value": "public.url" },
-                    "Deleted": { "value": 0 },
-                    "Imported": { "value": 0 },
-                }),
-            ));
+            let (aid, op) = self.url_attachment(&name, url);
+            ops.push(op);
             attachment_ids.push(aid);
         }
         set("AttachmentIDs", json!(attachment_ids));
 
         let mut hashtag_ids = Vec::new();
-        for tag in d.tags.iter().map(|t| t.trim().trim_start_matches('#')).filter(|t| !t.is_empty()) {
-            let hid = new_id();
-            ops.push(create_op(
-                &format!("Hashtag/{hid}"),
-                "Hashtag",
-                None,
-                self.zone_id,
-                json!({
-                    "Reminder": { "value": self.reference(&name) },
-                    "Name": encrypted_string(tag),
-                    "Type": { "value": 0 },
-                    "CreationDate": { "value": now_ms },
-                    "Deleted": { "value": 0 },
-                    "Imported": { "value": 0 },
-                }),
-            ));
+        for tag in clean_tags(&d.tags) {
+            let (hid, op) = self.hashtag(&name, &tag);
+            ops.push(op);
             hashtag_ids.push(hid);
         }
         set("HashtagIDs", json!(hashtag_ids));
@@ -536,6 +555,80 @@ impl Writer<'_> {
         // The reminder goes first so the references from its children validate.
         ops.insert(0, create_op(&name, "Reminder", Some(&d.list), self.zone_id, Value::Object(fields)));
         (name, ops)
+    }
+
+    /// `DueDateDeltaAlertsData` for reminder `id` (bare UUID); no early
+    /// reminder is written as "on time", as Reminders does.
+    fn delta_alerts(&self, id: &str, alert: Option<EarlyAlert>) -> Value {
+        let alert = alert.unwrap_or(EarlyAlert { count: 0, unit: DeltaUnit::Minute });
+        let data = json!({
+            "dueDateDeltaAlerts": [{
+                "identifier": new_id(),
+                "dueDateDeltaCount": alert.count,
+                "dueDateDeltaUnit": alert.unit.raw(),
+                "creationDate": apple_time(Utc::now()),
+                "minimumSupportedAppVersion": 0,
+            }],
+            "reminderIdentifier": id,
+            "accountIdentifier": self.account_identifier,
+            "minimumSupportedVersion": DELTA_ALERTS_VERSION,
+        });
+        json!(B64.encode(data.to_string()))
+    }
+
+    /// A URL `Attachment` of `reminder`. Returns (bare UUID, operation).
+    fn url_attachment(&self, reminder: &str, url: &str) -> (String, Value) {
+        let aid = new_id();
+        let op = create_op(
+            &format!("Attachment/{aid}"),
+            "Attachment",
+            Some(reminder),
+            self.zone_id,
+            json!({
+                "Reminder": { "value": self.reference(reminder) },
+                "Type": { "value": "URL" },
+                "URL": encrypted_string(url),
+                "UTI": { "value": "public.url" },
+                "Deleted": { "value": 0 },
+                "Imported": { "value": 0 },
+            }),
+        );
+        (aid, op)
+    }
+
+    /// A `Hashtag` use on `reminder`. Returns (bare UUID, operation).
+    fn hashtag(&self, reminder: &str, tag: &str) -> (String, Value) {
+        let hid = new_id();
+        let op = create_op(
+            &format!("Hashtag/{hid}"),
+            "Hashtag",
+            None,
+            self.zone_id,
+            json!({
+                "Reminder": { "value": self.reference(reminder) },
+                "Name": encrypted_string(tag),
+                "Type": { "value": 0 },
+                "CreationDate": { "value": Utc::now().timestamp_millis() },
+                "Deleted": { "value": 0 },
+                "Imported": { "value": 0 },
+            }),
+        );
+        (hid, op)
+    }
+
+    /// Soft-delete a child record (Alarm, AlarmTrigger, Attachment, Hashtag).
+    /// Like icloud.com, only `Deleted` is written; children carry no tokens.
+    fn soft_delete(&self, record: &Value) -> Value {
+        json!({
+            "operationType": "update",
+            "record": {
+                "recordName": record["recordName"],
+                "recordType": record["recordType"],
+                "recordChangeTag": record["recordChangeTag"],
+                "zoneID": self.zone_id,
+                "fields": { "Deleted": { "value": 1 } },
+            },
+        })
     }
 
     /// An `Alarm` + `AlarmTrigger` (Type Date) firing at `at`.
@@ -601,6 +694,165 @@ impl Writer<'_> {
                 "fields": fields,
             },
         })
+    }
+
+    /// Operations applying `e` to the reminder `record` (empty when nothing
+    /// changed). Title and notes are CRDT edits as our replica. Child records
+    /// that change (due-date alarm, URL, tags) are soft-deleted and recreated,
+    /// as icloud.com does; other alarms are left alone.
+    pub fn edit(&self, store: &Store, record: &Value, e: &Edits) -> Result<Vec<Value>> {
+        let name = name_of(record);
+        let id = name.split_once('/').map_or(name.as_str(), |(_, id)| id).to_string();
+        let mut f = serde_json::Map::new();
+        let mut tokens = Vec::new();
+        let mut children = Vec::new();
+        let set = |f: &mut serde_json::Map<String, Value>, k: &str, v: Value| {
+            f.insert(k.to_string(), json!({ "value": v }));
+        };
+
+        for (key, token, new) in [("TitleDocument", "titleDocument", &e.title), ("NotesDocument", "notesDocument", &e.notes)] {
+            let Some(new) = new else { continue };
+            let blob = record["fields"][key]["value"].as_str().and_then(|v| B64.decode(v).ok());
+            let doc = match blob {
+                Some(blob) => {
+                    let old = document::text(&blob)?;
+                    if old == *new {
+                        continue;
+                    }
+                    crdt::edit(&blob, &old, new, self.replica)?
+                }
+                None if new.is_empty() => continue,
+                None => document::new(new, self.replica),
+            };
+            set(&mut f, key, json!(B64.encode(doc)));
+            tokens.push(token);
+        }
+        if let Some(flagged) = e.flagged.filter(|&v| int(record, "Flagged").is_none_or(|o| (o == 1) != v)) {
+            set(&mut f, "Flagged", json!(i64::from(flagged)));
+            tokens.push("flagged");
+        }
+        if let Some(p) = e.priority.filter(|p| int(record, "Priority") != Some(p.raw())) {
+            set(&mut f, "Priority", json!(p.raw()));
+            tokens.push("priority");
+        }
+        let moved_to = e.list.as_deref().filter(|l| reference(record, "List").as_deref() != Some(l));
+        if let Some(list) = moved_to {
+            set(&mut f, "List", self.reference(list));
+            tokens.push("list");
+        }
+
+        if let Some(sched) = &e.schedule {
+            let old = timestamp(record, "DueDate").map(|at| (at, int(record, "AllDay") == Some(1)));
+            let new = sched.due();
+            let due_changed = old != new;
+            if due_changed {
+                // Replace the alarm at the old due time (Reminders keeps one).
+                let mut alarm_ids = ids(record, "AlarmIDs");
+                if let Some((old_at, false)) = old {
+                    for alarm in store.related("Alarm", &alarm_ids.clone()) {
+                        let Some(trigger) = string(alarm, "TriggerID").and_then(|t| store.records.get(&format!("AlarmTrigger/{t}"))) else { continue };
+                        if string(trigger, "Type").as_deref() == Some("Date") && trigger_time(trigger) == Some(old_at) {
+                            children.push(self.soft_delete(alarm));
+                            children.push(self.soft_delete(trigger));
+                            let aid = name_of(alarm);
+                            alarm_ids.retain(|i| aid != format!("Alarm/{i}"));
+                        }
+                    }
+                }
+                // There's no "remove field"; icloud.com sends null [unverified here].
+                match new {
+                    None => {
+                        set(&mut f, "DueDate", Value::Null);
+                        set(&mut f, "AllDay", json!(0));
+                        set(&mut f, "TimeZone", Value::Null);
+                    }
+                    Some((at, all_day)) => {
+                        set(&mut f, "DueDate", json!(at.timestamp_millis()));
+                        set(&mut f, "AllDay", json!(i64::from(all_day)));
+                        if all_day {
+                            set(&mut f, "TimeZone", Value::Null);
+                        } else {
+                            let tz = iana_time_zone::get_timezone().unwrap_or_else(|_| "UTC".into());
+                            set(&mut f, "TimeZone", json!(tz));
+                            let (alarm_id, ops) = self.date_alarm(&name, at, &tz);
+                            alarm_ids.push(alarm_id);
+                            children.extend(ops);
+                        }
+                    }
+                }
+                tokens.extend(["dueDate", "allDay", "timeZone"]);
+                set(&mut f, "AlarmIDs", json!(alarm_ids));
+            }
+            let timed = matches!(new, Some((_, false)));
+            let old_alert = early_alerts(&record["fields"]["DueDateDeltaAlertsData"]).first().copied();
+            if timed && (due_changed || sched.early_alert != old_alert) {
+                set(&mut f, "DueDateDeltaAlertsData", self.delta_alerts(&id, sched.early_alert));
+            } else if !timed && record["fields"].get("DueDateDeltaAlertsData").is_some() && due_changed {
+                set(&mut f, "DueDateDeltaAlertsData", Value::Null);
+            }
+        }
+
+        if let Some(url) = &e.url {
+            let url = url.as_deref().map(str::trim).filter(|u| !u.is_empty());
+            let mut attachment_ids = ids(record, "AttachmentIDs");
+            let old: Vec<&Value> = store
+                .related("Attachment", &attachment_ids)
+                .into_iter()
+                .filter(|a| string(a, "Type").as_deref() == Some("URL"))
+                .collect();
+            let old_urls: Vec<String> = old.iter().filter_map(|a| string(a, "URL")).collect();
+            if old_urls != url.into_iter().map(str::to_string).collect::<Vec<_>>() {
+                for a in old {
+                    children.push(self.soft_delete(a));
+                    let aid = name_of(a);
+                    attachment_ids.retain(|i| aid != format!("Attachment/{i}"));
+                }
+                if let Some(url) = url {
+                    let (aid, op) = self.url_attachment(&name, url);
+                    children.push(op);
+                    attachment_ids.push(aid);
+                }
+                set(&mut f, "AttachmentIDs", json!(attachment_ids));
+            }
+        }
+
+        if let Some(tags) = &e.tags {
+            let tags = clean_tags(tags);
+            let mut hashtag_ids = ids(record, "HashtagIDs");
+            let old = store.related("Hashtag", &hashtag_ids);
+            let mut changed = false;
+            for h in &old {
+                if !string(h, "Name").is_some_and(|n| tags.contains(&n)) {
+                    children.push(self.soft_delete(h));
+                    let hid = name_of(h);
+                    hashtag_ids.retain(|i| hid != format!("Hashtag/{i}"));
+                    changed = true;
+                }
+            }
+            let old_names: Vec<String> = old.iter().filter_map(|h| string(h, "Name")).collect();
+            for tag in tags.iter().filter(|t| !old_names.contains(t)) {
+                let (hid, op) = self.hashtag(&name, tag);
+                children.push(op);
+                hashtag_ids.push(hid);
+                changed = true;
+            }
+            if changed {
+                set(&mut f, "HashtagIDs", json!(hashtag_ids));
+            }
+        }
+
+        if f.is_empty() && children.is_empty() {
+            return Ok(Vec::new());
+        }
+        set(&mut f, "LastModifiedDate", json!(Utc::now().timestamp_millis()));
+        tokens.push("lastModifiedDate");
+        let mut op = self.update(record, f, &tokens);
+        if let Some(list) = moved_to {
+            op["record"]["parent"] = json!({ "recordName": list });
+        }
+        // The reminder first, so new children's references validate.
+        children.insert(0, op);
+        Ok(children)
     }
 
     /// Mark a reminder done or not done.
@@ -820,5 +1072,119 @@ mod tests {
         assert_eq!(map["map"]["completed"]["counter"], 5);
         assert_eq!(map["map"]["completionDate"]["counter"], 1);
         assert_eq!(map["map"]["completed"]["replicaID"], "03030303-0303-0303-0303-030303030303");
+    }
+
+    #[test]
+    fn edit_changes_only_what_differs() {
+        let z = zone();
+        let w = Writer { zone_id: &z, replica: Uuid::from_bytes([3; 16]), account_identifier: None };
+        let title = B64.encode(document::new("Buy milk", Uuid::from_bytes([9; 16])));
+        let rec = json!({
+            "recordName": "Reminder/A", "recordType": "Reminder", "recordChangeTag": "t1",
+            "fields": {
+                "TitleDocument": { "type": "ENCRYPTED_BYTES", "value": title },
+                "Flagged": { "type": "INT64", "value": 0 },
+                "Priority": { "type": "INT64", "value": 0 },
+            },
+        });
+        let store = Store::new(z.clone());
+        let same = Edits {
+            title: Some("Buy milk".into()),
+            notes: Some(String::new()),
+            flagged: Some(false),
+            priority: Some(Priority::None),
+            schedule: Some(Schedule::default()),
+            url: Some(None),
+            tags: Some(vec![]),
+            ..Default::default()
+        };
+        assert!(w.edit(&store, &rec, &same).unwrap().is_empty());
+
+        let e = Edits { title: Some("Buy oat milk".into()), notes: Some("2 litres".into()), flagged: Some(true), ..same };
+        let ops = w.edit(&store, &rec, &e).unwrap();
+        assert_eq!(ops.len(), 1);
+        let f = &ops[0]["record"]["fields"];
+        let text = |k: &str| document::text(&B64.decode(f[k]["value"].as_str().unwrap()).unwrap()).unwrap();
+        assert_eq!(text("TitleDocument"), "Buy oat milk");
+        assert_eq!(text("NotesDocument"), "2 litres");
+        assert_eq!(f["Flagged"]["value"], 1);
+        assert!(f.get("Priority").is_none());
+        let map: Value = serde_json::from_str(f["ResolutionTokenMap"]["value"].as_str().unwrap()).unwrap();
+        for k in ["titleDocument", "notesDocument", "flagged", "lastModifiedDate"] {
+            assert_eq!(map["map"][k]["counter"], 1, "{k}");
+        }
+        assert!(map["map"].get("priority").is_none());
+    }
+
+    /// Round trip through a store: create, then edit date, list, URL and tags.
+    #[test]
+    fn edit_replaces_children() {
+        let z = zone();
+        let w = Writer { zone_id: &z, replica: Uuid::from_bytes([3; 16]), account_identifier: None };
+        let day = NaiveDate::from_ymd_opt(2030, 5, 1).unwrap();
+        let d = Draft {
+            list: "List/L1".into(),
+            title: "x".into(),
+            due_date: Some(day),
+            due_time: Some((9, 0)),
+            url: Some("https://a.example".into()),
+            tags: vec!["keep".into(), "drop".into()],
+            ..Default::default()
+        };
+        let (name, ops) = w.create(&d);
+        let with_tags = |ops: &[Value]| -> Vec<Value> {
+            ops.iter().map(|o| {
+                let mut r = o["record"].clone();
+                r["recordChangeTag"] = json!("t");
+                r
+            }).collect()
+        };
+        let mut store = Store::new(z.clone());
+        store.apply(with_tags(&ops), None);
+        let old_alarm = store.reminders()[0].clone();
+        assert_eq!(old_alarm.due.as_ref().unwrap().local_date(), day);
+
+        let e = Edits {
+            list: Some("List/L2".into()),
+            schedule: Some(Schedule { due_date: Some(day), due_time: Some((10, 30)), early_alert: Some(EarlyAlert { count: -5, unit: DeltaUnit::Minute }) }),
+            url: Some(Some("https://b.example".into())),
+            tags: Some(vec!["keep".into(), "#new".into()]),
+            ..Default::default()
+        };
+        let rec = store.record(&name).unwrap().clone();
+        let ops = w.edit(&store, &rec, &e).unwrap();
+        let r = &ops[0]["record"];
+        assert_eq!(r["recordName"], name.as_str());
+        assert_eq!(r["parent"]["recordName"], "List/L2");
+        let deletes = ops.iter().filter(|o| o["record"]["fields"]["Deleted"]["value"] == 1 && o["operationType"] == "update").count();
+        assert_eq!(deletes, 4, "alarm, trigger, URL, #drop");
+
+        // Fold the edit back in (updates merge their fields) and read it.
+        let mut merged = Vec::new();
+        for o in with_tags(&ops) {
+            let mut base = store.record(o["recordName"].as_str().unwrap()).cloned().unwrap_or_else(|| o.clone());
+            for (k, v) in o["fields"].as_object().unwrap() {
+                base["fields"][k] = v.clone();
+            }
+            if let Some(p) = o.get("parent") { base["parent"] = p.clone(); }
+            merged.push(base);
+        }
+        store.apply(merged, None);
+        let r = store.reminders().into_iter().find(|r| r.record_name == name).unwrap();
+        assert_eq!(r.list.as_deref(), Some("List/L2"));
+        let due = r.due.unwrap();
+        assert_eq!(due.at.with_timezone(&Local).hour(), 10);
+        assert!(r.alarms.is_empty(), "old 9:00 alarm gone");
+        assert_eq!(r.early_alerts, vec![EarlyAlert { count: -5, unit: DeltaUnit::Minute }]);
+        assert_eq!(r.urls, vec!["https://b.example"]);
+        let mut tags = r.tags.clone();
+        tags.sort();
+        assert_eq!(tags, vec!["keep", "new"]);
+
+        // Clearing the date nulls DueDate and drops the alarm.
+        let rec = store.record(&name).unwrap().clone();
+        let ops = w.edit(&store, &rec, &Edits { schedule: Some(Schedule::default()), ..Default::default() }).unwrap();
+        assert_eq!(ops[0]["record"]["fields"]["DueDate"]["value"], Value::Null);
+        assert_eq!(ops.len(), 3);
     }
 }

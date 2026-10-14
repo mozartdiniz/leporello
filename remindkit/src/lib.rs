@@ -13,7 +13,7 @@ mod srp;
 pub mod wire;
 
 pub use auth::{ICloudClient, SignInOutcome, TrustedPhone};
-pub use model::{DeltaUnit, Draft, Due, EarlyAlert, List, Priority, Reminder, Store, Writer};
+pub use model::{DeltaUnit, Draft, Edits, Schedule, Due, EarlyAlert, List, Priority, Reminder, Store, Writer};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
