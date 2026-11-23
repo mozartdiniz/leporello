@@ -75,6 +75,9 @@ pub struct Inner {
     phones: RefCell<Vec<TrustedPhone>>,
     progress: RefCell<Option<adw::Dialog>>,
     signin_toast: RefCell<Option<adw::Toast>>,
+    /// The keyring session as last loaded or saved, to tell when another app
+    /// (amadeuz) has stored a new one.
+    keyring_session: RefCell<Option<String>>,
 }
 
 thread_local! {
@@ -300,6 +303,7 @@ pub fn start(app: &adw::Application) {
         phones: RefCell::new(Vec::new()),
         progress: RefCell::new(None),
         signin_toast: RefCell::new(None),
+        keyring_session: RefCell::new(None),
     });
     CONTROLLER.with(|c| c.replace(Some(inner.clone())));
 
@@ -388,6 +392,8 @@ pub fn start(app: &adw::Application) {
         if let Some(c) = controller() {
             if c.signed_in.get() {
                 c.sync();
+            } else {
+                c.adopt_session();
             }
         }
         glib::ControlFlow::Continue
@@ -428,11 +434,9 @@ impl Inner {
     fn restore_session(self: &Rc<Self>) {
         let this = self.clone();
         glib::spawn_future_local(async move {
-            let Some(saved) = secrets::load_session().await else {
-                this.show_signed_out();
-                return;
-            };
-            let Ok(mut client) = ICloudClient::restore(&saved) else {
+            let saved = secrets::load_session().await;
+            this.keyring_session.replace(saved.clone());
+            let Some(Ok(mut client)) = saved.as_deref().map(ICloudClient::restore) else {
                 this.show_signed_out();
                 return;
             };
@@ -442,11 +446,7 @@ impl Inner {
             })
             .await;
             match res {
-                Ok(()) => {
-                    this.client.replace(Some(client.clone()));
-                    secrets::save_session(client.save()).await;
-                    this.on_signed_in();
-                }
+                Ok(()) => this.use_session(client).await,
                 Err(Error::Http(e)) => {
                     // Offline: keep the client and the cached store; retry on the next sync.
                     log::warn!("session check failed: {e}");
@@ -462,6 +462,46 @@ impl Inner {
                 }
             }
         });
+    }
+
+    /// While signed out: switch to a session that amadeuz (which shares the
+    /// keyring entry) saved since we last looked. Quiet if there's none.
+    fn adopt_session(self: &Rc<Self>) {
+        let this = self.clone();
+        glib::spawn_future_local(async move {
+            let Some(saved) = secrets::load_session().await else { return };
+            if this.signed_in.get() || this.keyring_session.borrow().as_deref() == Some(saved.as_str()) {
+                return;
+            }
+            this.keyring_session.replace(Some(saved.clone()));
+            let Ok(mut client) = ICloudClient::restore(&saved) else { return };
+            let (client, res) = bg(async move {
+                let r = client.validate().await;
+                (client, r)
+            })
+            .await;
+            match res {
+                Ok(()) if !this.signed_in.get() => {
+                    log::info!("signed in with the session shared in the keyring");
+                    this.use_session(client).await;
+                }
+                Ok(()) => {}
+                Err(e) => log::info!("shared session unusable: {e}"),
+            }
+        });
+    }
+
+    /// A validated or freshly signed-in session: keep it, store it for the
+    /// next launch and for amadeuz, and sync.
+    async fn use_session(self: &Rc<Self>, client: ICloudClient) {
+        self.client.replace(Some(client.clone()));
+        let saved = client.save();
+        self.keyring_session.replace(Some(saved.clone()));
+        secrets::save_session(saved).await;
+        if let Some(t) = self.signin_toast.take() {
+            t.dismiss();
+        }
+        self.on_signed_in();
     }
 
     fn show_signed_out(&self) {
@@ -495,7 +535,10 @@ impl Inner {
     fn sign_out(self: &Rc<Self>) {
         let dialog = adw::AlertDialog::new(
             Some("Sign Out of iCloud?"),
-            Some("Saved reminders are removed from this computer. Nothing changes in iCloud."),
+            Some(
+                "Saved reminders are removed from this computer. Nothing changes in iCloud. \
+                 Apps that share this sign-in, like Amadeuz Notes, will ask you to sign in again.",
+            ),
         );
         dialog.add_response("cancel", "Cancel");
         dialog.add_response("out", "Sign Out");
@@ -532,7 +575,9 @@ impl Inner {
         group.add(&pw_row);
 
         let body = error.unwrap_or_else(|| {
-            "Your password goes only to Apple; the sign-in session is kept in your system keyring.".into()
+            "Your password goes only to Apple. The sign-in is kept in your system keyring and shared \
+             with Amadeuz Notes."
+                .into()
         });
         let dialog = adw::AlertDialog::new(Some("Sign In to iCloud"), Some(&body));
         dialog.set_extra_child(Some(&group));
@@ -641,11 +686,7 @@ impl Inner {
 
     async fn finish_sign_in(self: &Rc<Self>) {
         let Some(client) = self.client.borrow().clone() else { return };
-        secrets::save_session(client.save()).await;
-        if let Some(t) = self.signin_toast.take() {
-            t.dismiss();
-        }
-        self.on_signed_in();
+        self.use_session(client).await;
     }
 
     fn show_progress(&self, text: &str) {
@@ -714,7 +755,10 @@ impl Inner {
                     this.resolve_urgent();
                     this.check_alerts();
                 }
-                Err(Error::SessionExpired | Error::NotSignedIn) => this.show_signed_out(),
+                Err(Error::SessionExpired | Error::NotSignedIn) => {
+                    this.show_signed_out();
+                    this.adopt_session();
+                }
                 Err(Error::Http(e)) => log::warn!("sync failed (offline?): {e}"),
                 Err(e) => this.toast(&format!("Couldn't sync: {e}")),
             }
@@ -749,7 +793,10 @@ impl Inner {
                     this.toast("It changed on another device. Refreshed; try again.");
                     this.sync();
                 }
-                Err(Error::SessionExpired) => this.show_signed_out(),
+                Err(Error::SessionExpired) => {
+                    this.show_signed_out();
+                    this.adopt_session();
+                }
                 Err(e) => this.toast(&format!("Couldn't save: {e}")),
             }
         });

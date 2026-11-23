@@ -65,6 +65,8 @@ struct SessionState {
     #[serde(default)]
     code_target: CodeTarget,
     /// This installation's CRDT replica UUID: the "device" amadeuz edits come from.
+    /// Leporello and amadeuz share the saved session, so they share this replica;
+    /// that's safe because they never edit the same documents.
     #[serde(default)]
     replica_uuid: Option<uuid::Uuid>,
 }

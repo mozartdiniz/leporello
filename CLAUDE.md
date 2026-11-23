@@ -23,7 +23,11 @@ touches records.
   Rust, no Blueprint/Meson. `cargo run` works on macOS with Homebrew GTK too
 - tokio for network; GTK awaits tokio `JoinHandle`s through `crate::bg`, so
   UI code stays on the main thread
-- `keyring` for the iCloud web session
+- `keyring` (Secret Service on Linux, not `linux-native`: kernel keyutils is
+  in-memory and loses the session on reboot) for the iCloud web session.
+  The entry (`io.github.mozartdiniz.iCloud` / `web-session`) is shared with
+  amadeuz: one sign-in for both. While signed out, the 60 s timer adopts a
+  session the other app saved (`adopt_session`); sign-out deletes it for both
 
 ## Layout
 
