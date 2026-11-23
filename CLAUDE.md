@@ -28,6 +28,11 @@ touches records.
   The entry (`io.github.mozartdiniz.iCloud` / `web-session`) is shared with
   amadeuz: one sign-in for both. While signed out, the 60 s timer adopts a
   session the other app saved (`adopt_session`); sign-out deletes it for both
+- Expired sessions are renewed in the background (`validate_or_renew`): the
+  Apple ID password is kept in the keyring (`apple-id-password`, shared) and
+  a password sign-in with the trust token needs no 2FA code. Never pushes a
+  code; a rejected password is deleted. The session is also checked every
+  6 h while running, which refreshes its cookies
 
 ## Layout
 

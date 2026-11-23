@@ -12,11 +12,12 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use adw::prelude::*;
 use chrono::{Local, NaiveDate, Utc};
 use gtk::{gio, glib};
-use remindkit::{Edits, Error, ICloudClient, List, Reminder, SignInOutcome, Store, TrustedPhone, Writer};
+use remindkit::{Edits, Error, ICloudClient, List, Reminder, Renewal, SignInOutcome, Store, TrustedPhone, Writer};
 use serde_json::Value;
 
 use crate::config::{self, State};
@@ -24,6 +25,10 @@ use crate::editor::{self, Action};
 use crate::{bg, notifier, secrets};
 
 const SYNC_INTERVAL_SECS: u32 = 60;
+/// How often a signed-in session is checked with Apple, which refreshes its
+/// cookies (they last 30 days from the last check), so it stays alive.
+const KEEP_ALIVE: Duration = Duration::from_secs(6 * 3600);
+const RENEW_GAP: Duration = Duration::from_secs(600);
 /// Completed reminders shown at most (the account has hundreds).
 const COMPLETED_LIMIT: usize = 300;
 
@@ -78,6 +83,14 @@ pub struct Inner {
     /// The keyring session as last loaded or saved, to tell when another app
     /// (amadeuz) has stored a new one.
     keyring_session: RefCell<Option<String>>,
+    /// The password typed into the sign-in dialog, kept until the sign-in
+    /// (and any 2FA code) succeeds, then stored for background renewals.
+    pending_password: RefCell<Option<String>>,
+    /// When the session was last renewed after Apple refused it: at most one
+    /// attempt per RENEW_GAP, so a session that can't be renewed doesn't loop.
+    last_renew: Cell<Option<Instant>>,
+    /// When the session was last checked with Apple (KEEP_ALIVE).
+    last_check: Cell<Instant>,
 }
 
 thread_local! {
@@ -304,6 +317,9 @@ pub fn start(app: &adw::Application) {
         progress: RefCell::new(None),
         signin_toast: RefCell::new(None),
         keyring_session: RefCell::new(None),
+        pending_password: RefCell::new(None),
+        last_renew: Cell::new(None),
+        last_check: Cell::new(Instant::now()),
     });
     CONTROLLER.with(|c| c.replace(Some(inner.clone())));
 
@@ -390,7 +406,9 @@ pub fn start(app: &adw::Application) {
     inner.restore_session();
     glib::timeout_add_seconds_local(SYNC_INTERVAL_SECS, || {
         if let Some(c) = controller() {
-            if c.signed_in.get() {
+            if c.signed_in.get() && c.last_check.get().elapsed() >= KEEP_ALIVE {
+                c.check_session();
+            } else if c.signed_in.get() {
                 c.sync();
             } else {
                 c.adopt_session();
@@ -440,13 +458,20 @@ impl Inner {
                 this.show_signed_out();
                 return;
             };
+            let password = secrets::load_password().await;
             let (client, res) = bg(async move {
-                let r = client.validate().await;
+                let r = client.validate_or_renew(password.as_deref()).await;
                 (client, r)
             })
             .await;
+            this.last_check.set(Instant::now());
             match res {
-                Ok(()) => this.use_session(client).await,
+                Ok(how) => {
+                    if how != Renewal::Valid {
+                        log::info!("iCloud session renewed in the background ({how:?})");
+                    }
+                    this.use_session(client).await
+                }
                 Err(Error::Http(e)) => {
                     // Offline: keep the client and the cached store; retry on the next sync.
                     log::warn!("session check failed: {e}");
@@ -456,9 +481,73 @@ impl Inner {
                 }
                 Err(e) => {
                     log::info!("saved session unusable: {e}");
+                    if matches!(e, Error::BadCredentials) {
+                        secrets::delete_password().await;
+                    }
                     // Keep it: its trust token can skip 2FA on the next sign-in.
                     this.client.replace(Some(client));
                     this.show_signed_out();
+                }
+            }
+        });
+    }
+
+    /// Apple refused the session during a sync or a save: renew it in the
+    /// background (saved session token, then saved password + trust token),
+    /// and only if that fails show "Not signed in".
+    fn renew(self: &Rc<Self>) {
+        let recent = self.last_renew.get().is_some_and(|t| t.elapsed() < RENEW_GAP);
+        let client = self.client.borrow().clone();
+        let (false, Some(client)) = (recent, client) else {
+            self.show_signed_out();
+            self.adopt_session();
+            return;
+        };
+        self.last_renew.set(Some(Instant::now()));
+        self.run_check(client, true);
+    }
+
+    /// The periodic check (KEEP_ALIVE): Apple refreshes the cookies, which
+    /// are saved, so the session doesn't run out while the app is in use.
+    fn check_session(self: &Rc<Self>) {
+        self.last_check.set(Instant::now());
+        let Some(client) = self.client.borrow().clone() else { return };
+        self.run_check(client, false);
+    }
+
+    fn run_check(self: &Rc<Self>, mut client: ICloudClient, after_refusal: bool) {
+        let this = self.clone();
+        glib::spawn_future_local(async move {
+            let password = secrets::load_password().await;
+            let (client, res) = bg(async move {
+                let r = client.validate_or_renew(password.as_deref()).await;
+                (client, r)
+            })
+            .await;
+            match res {
+                Ok(how) => {
+                    if how != Renewal::Valid {
+                        log::info!("iCloud session renewed in the background ({how:?})");
+                    }
+                    if after_refusal || how != Renewal::Valid {
+                        this.use_session(client).await;
+                    } else if this.keyring_session.borrow().as_deref() != Some(client.save().as_str()) {
+                        // Same session, fresher cookies.
+                        this.client.replace(Some(client.clone()));
+                        let saved = client.save();
+                        this.keyring_session.replace(Some(saved.clone()));
+                        secrets::save_session(saved).await;
+                    }
+                }
+                Err(Error::Http(e)) => log::warn!("session check failed (offline?): {e}"),
+                Err(e) => {
+                    log::info!("session could not be renewed: {e}");
+                    if matches!(e, Error::BadCredentials) {
+                        secrets::delete_password().await;
+                    }
+                    this.client.replace(Some(client));
+                    this.show_signed_out();
+                    this.adopt_session();
                 }
             }
         });
@@ -576,7 +665,8 @@ impl Inner {
 
         let body = error.unwrap_or_else(|| {
             "Your password goes only to Apple. The sign-in is kept in your system keyring and shared \
-             with Amadeuz Notes."
+             with Amadeuz Notes, and so is your password, so an expired sign-in can be renewed \
+             without you. Signing out removes both."
                 .into()
         });
         let dialog = adw::AlertDialog::new(Some("Sign In to iCloud"), Some(&body));
@@ -596,6 +686,7 @@ impl Inner {
                 return;
             }
             c.show_progress("Signing in to iCloud…");
+            c.pending_password.replace(Some(password.clone()));
             let mut client = c.client.borrow().clone().unwrap_or_default();
             glib::spawn_future_local(async move {
                 let (client, res) = bg(async move {
@@ -611,7 +702,10 @@ impl Inner {
                         c.phones.replace(phones);
                         c.show_code(None);
                     }
-                    Err(e) => c.show_sign_in(Some(e.to_string())),
+                    Err(e) => {
+                        c.pending_password.replace(None);
+                        c.show_sign_in(Some(e.to_string()))
+                    }
                 }
             });
         });
@@ -686,6 +780,10 @@ impl Inner {
 
     async fn finish_sign_in(self: &Rc<Self>) {
         let Some(client) = self.client.borrow().clone() else { return };
+        if let Some(password) = self.pending_password.take() {
+            secrets::save_password(password).await;
+        }
+        self.last_renew.set(None);
         self.use_session(client).await;
     }
 
@@ -755,7 +853,8 @@ impl Inner {
                     this.resolve_urgent();
                     this.check_alerts();
                 }
-                Err(Error::SessionExpired | Error::NotSignedIn) => {
+                Err(Error::SessionExpired) => this.renew(),
+                Err(Error::NotSignedIn) => {
                     this.show_signed_out();
                     this.adopt_session();
                 }
@@ -794,8 +893,8 @@ impl Inner {
                     this.sync();
                 }
                 Err(Error::SessionExpired) => {
-                    this.show_signed_out();
-                    this.adopt_session();
+                    this.toast("The iCloud session had expired and is being renewed. Try again in a moment.");
+                    this.renew();
                 }
                 Err(e) => this.toast(&format!("Couldn't save: {e}")),
             }

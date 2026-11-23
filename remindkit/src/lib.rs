@@ -12,7 +12,7 @@ pub mod model;
 mod srp;
 pub mod wire;
 
-pub use auth::{ICloudClient, SignInOutcome, TrustedPhone};
+pub use auth::{ICloudClient, Renewal, SignInOutcome, TrustedPhone};
 pub use model::{DeltaUnit, Draft, Edits, Schedule, Due, EarlyAlert, List, Priority, Reminder, Store, Writer};
 
 #[derive(Debug, thiserror::Error)]

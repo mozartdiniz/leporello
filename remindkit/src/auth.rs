@@ -8,6 +8,13 @@
 //!
 //! The whole session (headers state + cookie jar) serialises to JSON so the
 //! caller can keep it in the platform keyring and skip 2FA on later launches.
+//!
+//! When Apple expires the web session, [`ICloudClient::validate_or_renew`] gets
+//! a new one without the user, if the caller kept the password: a password
+//! sign-in that presents the 2FA trust token, which Apple accepts without a code
+//! while it trusts this computer. It never pushes a 2FA code. (Reusing the saved
+//! session token for `accountLogin` does not work: Apple answers 421, checked
+//! live 2026-11-23.)
 
 use std::sync::Arc;
 
@@ -34,6 +41,16 @@ pub enum SignInOutcome {
     /// A code was pushed to the user's trusted Apple devices; call `submit_code`.
     /// `phones` can receive the code by SMS instead (`request_sms`).
     NeedsCode { phones: Vec<TrustedPhone> },
+}
+
+/// How [`ICloudClient::validate_or_renew`] got a working session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Renewal {
+    /// The saved session was still valid.
+    Valid,
+    /// Apple had expired it; a new one was made with the saved password and
+    /// the trust token (no 2FA code). Save the session.
+    ByPassword,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -164,6 +181,46 @@ impl ICloudClient {
     // ── Sign-in ───────────────────────────────────────────────────────────────
 
     pub async fn sign_in(&mut self, apple_id: &str, password: &str) -> Result<SignInOutcome> {
+        match self.srp_sign_in(apple_id, password).await? {
+            StatusCode::OK => {
+                if self.account_login().await? {
+                    self.start_two_factor().await
+                } else {
+                    Ok(SignInOutcome::SignedIn)
+                }
+            }
+            // 409: two-factor challenge.
+            _ => self.start_two_factor().await,
+        }
+    }
+
+    /// Check the session; if Apple has expired it and `password` is given, make
+    /// a new one with a password sign-in presenting the trust token, so Apple
+    /// skips 2FA while it still trusts this computer.
+    ///
+    /// Never pushes a 2FA code. `SessionExpired` means the user must sign in;
+    /// `BadCredentials` means the saved password is wrong: forget it, or
+    /// repeated tries could get the Apple ID locked. After `ByPassword`, save
+    /// the session.
+    pub async fn validate_or_renew(&mut self, password: Option<&str>) -> Result<Renewal> {
+        match self.validate().await {
+            Ok(()) => return Ok(Renewal::Valid),
+            Err(Error::SessionExpired) => {}
+            Err(e) => return Err(e),
+        }
+        let (Some(apple_id), Some(password)) = (self.state.apple_id.clone(), password) else {
+            return Err(Error::SessionExpired);
+        };
+        match self.srp_sign_in(&apple_id, password).await? {
+            StatusCode::OK if !self.account_login().await? => Ok(Renewal::ByPassword),
+            // Apple wants a code: leave it to the user's own sign-in.
+            _ => Err(Error::SessionExpired),
+        }
+    }
+
+    /// SRP sign-in up to `signin/complete`. Returns 200 (signed in) or 409
+    /// (2FA needed; nothing has been pushed yet), errors otherwise.
+    async fn srp_sign_in(&mut self, apple_id: &str, password: &str) -> Result<StatusCode> {
         self.state.apple_id = Some(apple_id.to_string());
         let srp = SrpClient::new();
 
@@ -216,15 +273,7 @@ impl ICloudClient {
         self.capture_headers(&resp);
 
         match resp.status() {
-            StatusCode::OK => {
-                if self.account_login().await? {
-                    self.start_two_factor().await
-                } else {
-                    Ok(SignInOutcome::SignedIn)
-                }
-            }
-            // 409: two-factor challenge.
-            StatusCode::CONFLICT => self.start_two_factor().await,
+            s @ (StatusCode::OK | StatusCode::CONFLICT) => Ok(s),
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(Error::BadCredentials),
             StatusCode::PRECONDITION_FAILED => Err(Error::AccountActionRequired(
                 "sign in once at icloud.com to accept Apple's terms".into(),
